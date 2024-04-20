@@ -1,122 +1,164 @@
 import streamlit as st
-import pytube
-from pytube import YouTube
-import torch
-from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline, MBartForConditionalGeneration, MBart50TokenizerFast
-import librosa
-import soundfile as sf
+import os
+import urllib.parse
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+import google.generativeai as genai
+from dotenv import load_dotenv
+from textblob import TextBlob
+from youtube_transcript_api import YouTubeTranscriptApi
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+# Load environment variables
+load_dotenv()
 
-# Load the Whisper Model
-model_id = "openai/whisper-large-v3"
-model = AutoModelForSpeechSeq2Seq.from_pretrained(model_id)
-processor = AutoProcessor.from_pretrained(model_id)
-pipe = pipeline("automatic-speech-recognition", model=model, tokenizer=processor.tokenizer)
+# Configure Google GenerativeAI
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
-# Load translation model and tokenizer
-translation_model = MBartForConditionalGeneration.from_pretrained("facebook/mbart-large-50-one-to-many-mmt")
-tokenizer = MBart50TokenizerFast.from_pretrained("facebook/mbart-large-50-one-to-many-mmt", src_lang="en_XX")
-def download_and_extract_audio(youtube_url):
-    """Downloads YouTube video audio and converts it to WAV format.
+DEVELOPER_KEY = 'AIzaSyDYi0hx3ReDAlCz3GXom7hyj8t0vvjWcKs'  # Replace with your own developer key
+YOUTUBE_API_SERVICE_NAME = 'youtube'
+YOUTUBE_API_VERSION = 'v3'
+youtube = build(YOUTUBE_API_SERVICE_NAME, YOUTUBE_API_VERSION, developerKey=DEVELOPER_KEY)
 
-    Args:
-        youtube_url: The URL of the YouTube video.
+def extract_video_id(url):
+    query = urllib.parse.urlparse(url)
+    if query.hostname == 'youtu.be':
+        return query.path[1:]
+    if query.hostname in ('www.youtube.com', 'youtube.com'):
+        if query.path == '/watch':
+            p = urllib.parse.parse_qs(query.query)
+            return p['v'][0]
+        if query.path[:7] == '/embed/':
+            return query.path.split('/')[2]
+        if query.path[:3] == '/v/':
+            return query.path.split('/')[2]
+    raise ValueError('Invalid YouTube URL or unable to extract video ID.')
 
-    Returns:
-        A list of audio file paths (if chunking is used) or None (if error occurs).
-    """
-
+def get_comments(video_id, max_results=100):
     try:
-        # Download YouTube video
-        yt = YouTube(youtube_url)
-        stream = yt.streams.filter(only_audio=True, file_extension='mp4').first()
-        stream.download(filename='ytaudio.mp4')
+        response = youtube.commentThreads().list(
+            part='snippet',
+            videoId=video_id,
+            textFormat='plainText',
+            maxResults=max_results
+        ).execute()
 
-        # Convert MP4 to WAV using FFmpeg
-        import subprocess
-        subprocess.run(['ffmpeg', '-i', 'ytaudio.mp4', '-acodec', 'pcm_s16le', '-ar', '16000', 'ytaudio.wav'])
+        comments = []
+        for item in response['items']:
+            comment = item['snippet']['topLevelComment']['snippet']['textDisplay']
+            comments.append(comment)
 
-        # Check for potential Out-of-Memory (OOM) error by using chunking
-        input_file = 'ytaudio.wav'  # Use the converted WAV file
-        sample_rate = librosa.get_samplerate(input_file)
+        return comments
+    except HttpError as e:
+        print(f'An error occurred: {e}')
+        return []
 
-        if sample_rate * librosa.core.frames_to_time(librosa.load(input_file)[0].shape[0]) > 100000000:  # Adjust threshold as needed
-            # Audio Chunking
-            audio_paths = []
-            stream = librosa.stream(input_file, block_length=30, frame_length=16000, hop_length=16000)
-            for i, speech in enumerate(stream):
-                sf.write(f'{i}.wav', speech, 16000)
-                audio_paths.append(f'{i}.wav')
-            return audio_paths
-        else:
-            # No chunking needed
-            return ['ytaudio.wav']  # Return a list with single audio path
-
-    except Exception as e:
-        st.error(f"Error downloading or processing audio: {e}")
-        return None
-
-def transcribe_audio(audio_paths):
-    """Performs speech recognition (ASR) on the audio.
-
-    Args:
-        audio_paths: A list of audio file paths.
-
-    Returns:
-        A string containing the combined transcript from all audio segments.
-    """
+def extract_comments(video_url):
     try:
-        transcripts = [pipe(audio_path)[0]['transcription'] for audio_path in audio_paths]
-        full_transcript = ' '.join(transcripts)
-        return full_transcript
+        video_id = extract_video_id(video_url)
+        comments = get_comments(video_id)
+        return comments
+    except ValueError as e:
+        print(f'Error extracting comments: {e}')
+        return []
+
+# Function to perform sentiment analysis on comments
+def analyze_sentiment(comments):
+    sentiment_scores = []
+    for comment in comments:
+        comment_blob = TextBlob(comment)
+        sentiment_scores.append(comment_blob.sentiment.polarity)  # Get polarity score for sentiment
+
+    average_sentiment = sum(sentiment_scores) / len(sentiment_scores)
+    return average_sentiment
+
+# Function to generate prompt for Gemini Pro based on sentiment analysis
+def generate_prompt(sentiment_text):
+    prompt = f"Based on the sentiment analysis of the comments, summarize the overall public opinion on the YouTube video with proper headings based on the opions of the public. Comments are mostly {sentiment_text}."
+    return prompt
+
+# Function to generate summary using Gemini Pro
+def generate_summary(comments, prompt):
+    model = genai.GenerativeModel("gemini-pro")
+    response = model.generate_content(prompt + " ".join(comments))
+    return response.text
+
+# Function to extract transcript details from a YouTube video URL
+def extract_transcript_details(youtube_video_url):
+    try:
+        video_id = youtube_video_url.split("=")[1]
+        transcript_text = YouTubeTranscriptApi.get_transcript(video_id)
+
+        transcript = ""
+        for i in transcript_text:
+            transcript += " " + i["text"]
+
+        return transcript
     except Exception as e:
-        st.error(f"Error transcribing audio: {e}")
-        return None
-    
-def translate_summary(summary_text, target_language):
-    # Translate the summarized text to the target language
-    model_inputs = tokenizer(summary_text, return_tensors="pt", padding=True)
-    generated_tokens = translation_model.generate(
-        **model_inputs,
-        forced_bos_token_id=tokenizer.lang_code_to_id[target_language]
-    )
-    translated_text = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0]
-    return translated_text
-def main():
-    st.title("YouTube Video Summarization with Whisper Model")
+        raise e
 
-    youtube_url = st.text_input("Enter YouTube video URL (or 'q' to quit): ")
+# Streamlit UI
+st.title('YouTube Video Analyzer')
 
-    if youtube_url.lower() == 'q':
-        st.stop()
-        return
+# Get user input for YouTube video URL
+video_url = st.text_input('Enter the YouTube video URL:', '')
 
-    if not youtube_url:
-        st.warning("Please enter a YouTube video URL.")
-        return
+# Button to trigger summary generation
+if st.button("Generate Summary"):
+    if video_url:
+        # Extract transcript details
+        transcript_text = extract_transcript_details(video_url)
 
-    # Download and process audio
-    audio_paths = download_and_extract_audio(youtube_url)
-    if not audio_paths:
-        return
+        # Generate summary using Gemini Pro
+        prompt = "Welcome, Video Summarizer! Your task is to distill the essence of a given YouTube video transcript into a concise summary with proper headings. Your summary should capture the key points and essential information, presented in bullet points, within a 250-word limit. Let's dive into the provided transcript and extract the vital details for our audience."
+        summary = generate_summary(transcript_text, prompt)
+        st.markdown("## Summary of Transcript:")
+        st.write(summary)
+        
+        # Store the generated summary in session state
+        st.session_state['transcript_summary'] = summary
 
-    # Perform speech recognition
-    full_transcript = transcribe_audio(audio_paths)
+# Button to trigger comment analysis
+if st.button("Analyze Comments"):
+    if video_url:
+        # Extract comments
+        comments = extract_comments(video_url)
+        if comments:
+            st.success('Comments extracted successfully!')
+            st.write('Number of comments extracted:', len(comments))
 
-    # Display transcript
-    if full_transcript:
-        st.success("**Full Transcript:**")
-        st.write(full_transcript)
+            # Perform sentiment analysis
+            average_sentiment = analyze_sentiment(comments)
+            sentiment_text = "positive" if average_sentiment > 0 else "negative" if average_sentiment < 0 else "neutral"
+            st.write(f"Overall sentiment of the comments: {sentiment_text}")
 
-        # Button for translation
-        if st.button("Translate"):
-            target_language = st.selectbox("Select Target Language:", ["Hindi", "Telugu", "Tamil", "Kannada", "Malayalam", "Urdu"])
-            if target_language:
-                # Translate summary to the selected language
-                translated_summary = translate_summary(full_transcript, target_language.lower())
-                st.success(f"**Translated Summary ({target_language}):**")
-                st.write(translated_summary)
+            # Generate prompt based on sentiment
+            prompt = generate_prompt(sentiment_text)
 
-if __name__ == "__main__":
-    main()
+            # Generate summary using Gemini Pro
+            comments_summary = generate_summary(comments, prompt)
+            st.markdown("## Summary of Comments:")
+            st.write(comments_summary)
+            
+            # Store the generated summary in session state
+            st.session_state['comments_summary'] = comments_summary
+
+# Conditionally display the transcript summary if it exists
+if 'transcript_summary' in st.session_state:
+    st.markdown("## Summary of Transcript:")
+    st.write(st.session_state['transcript_summary'])
+
+# Button to generate blog article
+if st.button("Generate Blog"):
+    if 'transcript_summary' in st.session_state and 'comments_summary' in st.session_state:
+        # Merge summaries
+        merged_summary = f"Summary of Transcript:\n\n{st.session_state['transcript_summary']}\n\nSummary of Comments:\n\n{st.session_state['comments_summary']}"
+
+        # Generate blog article using Gemini AI
+        prompt = "Based on the summary of the transcript and comments, generate a blog article discussing the key insights and public sentiment of the YouTube video. Your article should provide a comprehensive overview while maintaining a neutral tone."
+        model = genai.GenerativeModel("gemini-pro")
+        response = model.generate_content(prompt + merged_summary)
+        blog_article = response.text
+
+        # Display generated blog article
+        st.markdown("## Generated Blog Article:")
+        st.write(blog_article)
